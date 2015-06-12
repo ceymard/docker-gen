@@ -1,63 +1,150 @@
+{% mute %}
+
 server {
-	listen 80 default_server;
-	server_name _; # This is just an invalid value which will never trigger on a real hostname.
-	error_log /proc/self/fd/2;
-	access_log /proc/self/fd/1;
-	return 503;
-}
-
-{{ range $host, $containers := groupByMulti $ "Env.VIRTUAL_HOST" "," }}
-upstream {{ $host }} {
-
-{{ range $index, $value := $containers }}
-
-	{{ $addrLen := len $value.Addresses }}
-	{{/* If only 1 port exposed, use that */}}
-	{{ if eq $addrLen 1 }}
-		{{ with $address := index $value.Addresses 0 }}
-		   # {{$value.Name}}
-		   server {{ $address.IP }}:{{ $address.Port }};
-		{{ end }}
-
-	{{/* If more than one port exposed, use the one matching VIRTUAL_PORT env var */}}
-	{{ else if $value.Env.VIRTUAL_PORT }}
-		{{ range $i, $address := $value.Addresses }}
-		   {{ if eq $address.Port $value.Env.VIRTUAL_PORT }}
-		   # {{$value.Name}}
-		   server {{ $address.IP }}:{{ $address.Port }};
-		   {{ end }}
-		{{ end }}
-
-	{{/* Else default to standard web port 80 */}}
-	{{ else }}
-		{{ range $i, $address := $value.Addresses }}
-			{{ if eq $address.Port "80" }}
-			# {{$value.Name}}
-			server {{ $address.IP }}:{{ $address.Port }};
-			{{ end }}
-		{{ end }}
-	{{ end }}
-{{ end }}
+        listen 80 default_server;
+        server_name _; # This is just an invalid value which will never trigger on a real hostname.
+        return 503;
 }
 
 server {
-	gzip_types text/plain text/css application/json application/x-javascript text/xml application/xml application/xml+rss text/javascript;
+        listen 443 ssl default_server;
+        server_name _;
 
-	server_name {{ $host }};
-	proxy_buffering off;
-	error_log /proc/self/fd/2;
-	access_log /proc/self/fd/1;
+		{% if "/certs/default.crt"|exists and "/certs/default.key"|exists %}
+        ssl_certificate /etc/nginx/certs/default.crt;
+        ssl_certificate_key /etc/nginx/certs/default.key;
+        {% endif %}
+
+        return 503;
+}
+
+
+# If we receive X-Forwarded-Proto, pass it through; otherwise, pass along the
+# scheme used to connect to this server
+map $http_x_forwarded_proto $proxy_x_forwarded_proto {
+  default $http_x_forwarded_proto;
+  ''      $scheme;
+}
+
+# If we receive Upgrade, set Connection to "upgrade"; otherwise, delete any
+# Connection header that may have been passed to this server
+map $http_upgrade $proxy_connection {
+  default upgrade;
+  ''      '';
+}
+
+gzip_types text/plain text/css application/javascript application/json application/x-javascript text/xml application/xml application/xml+rss text/javascript;
+
+log_format vhost '$host $remote_addr - $remote_user [$time_local] '
+                 '"$request" $status $body_bytes_sent '
+                 '"$http_referer" "$http_user_agent"';
+
+access_log /proc/self/fd/1 vhost;
+error_log /proc/self/fd/2;
+
+# HTTP 1.1 support
+proxy_http_version 1.1;
+proxy_buffering off;
+proxy_set_header Host $http_host;
+proxy_set_header Upgrade $http_upgrade;
+proxy_set_header Connection $proxy_connection;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $proxy_x_forwarded_proto;
+
+
+{% for domain, conts in containers|groupByMulti:"Env.VIRTUAL_HOST|," %}
+#
+# 	DOMAIN {{ domain }}
+#
+
+
+{# On commence par définir les upstream ! #}
+
+upstream {{ domain }} {
+	{% for c in conts %}
+		{% if c.Env.VIRTUAL_HOST %}
+			{% set addr = c.Addresses.0 %}
+			{% set port = c.Env.VIRTUAL_PORT|default:"80" %}
+			{% if c.Addresses|length > 1 %}
+				{% for ad in c.Addresses %}
+					{% if ad.Port == port %}
+						{% set addr = ad %}
+					{% endif %}
+				{% endfor %}
+			{% endif %}
+	# {{ c.Name }}
+	server {{ addr.IP }}:{{ addr.Port }};
+		{% endif %}
+	{% endfor %}
+}
+
+	{# We look for a certificate for the given domain #}
+	{% if "/certs/"|add:domain|add:".crt"|exists and "/certs/"|add:domain|add:".key"|exists %}
+		{% set cert = "/certs/"|add:domain %}
+	{% elif "/certs/default.crt"|exists and "/certs/default.key"|exists %}
+		{% set cert = "/certs/default" %}
+	{% endif %}
+
+	{% if not cert %}
+{# NO CERTIFICATE, SO NOT LISTENING ON :443 #}
+server {
+	server_name {{ domain }};
+	client_max_body_size 2048M;   # adjust to taste
 
 	location / {
-		proxy_pass http://{{ $host }};
-		proxy_set_header Host $http_host;
-		proxy_set_header X-Real-IP $remote_addr;
-		proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-		proxy_set_header X-Forwarded-Proto $scheme;
+		proxy_pass http://{{ domain }};
 
-		# HTTP 1.1 support
-		proxy_http_version 1.1;
-		proxy_set_header Connection "";
+		{# Adding simple password authentication if /htpasswd has a file in it. #}
+		{% if "/htpasswd"|add:domain|exists %}
+		auth_basic	"Restricted {{ domain }}";
+		auth_basic_user_file	{{ "/htpasswd/"|add:domain }};
+		{% endif %}
 	}
 }
-{{ end }}
+
+	{% else %}
+# A certificate was found for this domain, so we create a rewrite for :80 to :443
+# and configure the server for it.
+server {
+	server_name {{ domain }};
+	rewrite ^(.*) https://{{ domain }}$1 permanent;
+}
+
+# And now the https
+server {
+	server_name {{ domain }};
+	listen 443 ssl;
+
+	ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
+	ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-DSS-AES128-GCM-SHA256:kEDH+AESGCM:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA:ECDHE-ECDSA-AES256-SHA:DHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA:DHE-DSS-AES128-SHA256:DHE-RSA-AES256-SHA256:DHE-DSS-AES256-SHA:DHE-RSA-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA256:AES256-SHA256:AES128-SHA:AES256-SHA:AES:CAMELLIA:DES-CBC3-SHA:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!aECDH:!EDH-DSS-DES-CBC3-SHA:!EDH-RSA-DES-CBC3-SHA:!KRB5-DES-CBC3-SHA;
+
+	ssl_prefer_server_ciphers on;
+	ssl_session_timeout 5m;
+	ssl_session_cache shared:SSL:50m;
+
+	ssl_certificate {{ cert|add:".crt" }};
+	ssl_certificate_key {{ cert|add:".key" }};
+
+	add_header Strict-Transport-Security "max-age=31536000; includeSubdomains";
+	client_max_body_size 2048M;   # adjust to taste
+
+	location / {
+		proxy_pass http://{{ domain }};
+
+		{# Adding simple password authentication if /htpasswd has a file in it. #}
+		{% if "/htpasswd"|add:key|exists %}
+		auth_basic	"Restricted {{ domain }}";
+		auth_basic_user_file	{{ "/htpasswd/"|add:domain }};
+		{% endif %}
+	}
+}
+
+
+
+	{% endif %}
+
+{% endfor %}
+
+
+{% endmute %}

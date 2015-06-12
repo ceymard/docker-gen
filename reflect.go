@@ -27,6 +27,10 @@ func deepGet(item interface{}, path string) interface{} {
 	parts := strings.Split(path, ".")
 	itemValue := reflect.ValueOf(item)
 
+	if (itemValue.Kind() == reflect.Ptr) {
+		itemValue = itemValue.Elem()
+	}
+
 	if len(parts) > 0 {
 		switch itemValue.Kind() {
 		case reflect.Struct:

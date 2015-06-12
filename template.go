@@ -4,136 +4,105 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
-	"net/url"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"syscall"
-	"text/template"
+	"regexp"
+	"gopkg.in/flosch/pongo2.v3"
 )
 
-func exists(path string) (bool, error) {
-	_, err := os.Stat(path)
+// Interface with the original deepGet to use it with pongo2 values.
+func deepGetValue(item *pongo2.Value, path string) *pongo2.Value {
+	return pongo2.AsValue(deepGet(item.Interface(), path))
+}
+
+// File exists
+func exists(path *pongo2.Value, param *pongo2.Value) (*pongo2.Value, *pongo2.Error) {
+	_, err := os.Stat(path.String())
+
 	if err == nil {
-		return true, nil
+		return pongo2.AsValue(true), nil
 	}
+
 	if os.IsNotExist(err) {
-		return false, nil
+		return pongo2.AsValue(false), nil
 	}
-	return false, err
+
+	return pongo2.AsValue(false), &pongo2.Error{Sender: "filter:exists", ErrorMsg: "Error"}
 }
 
-func groupByMulti(entries []*RuntimeContainer, key, sep string) map[string][]*RuntimeContainer {
-	groups := make(map[string][]*RuntimeContainer)
-	for _, v := range entries {
-		value := deepGet(*v, key)
-		if value != nil {
-			items := strings.Split(value.(string), sep)
+
+// Groups by a deep key and separate their content further with the given separator.
+// eg: value|groupByMulti:"my.deep.key|," (pipe is used to separate the separator from the key name)
+func groupByMulti(in *pongo2.Value, param *pongo2.Value) (out *pongo2.Value, err *pongo2.Error) {
+	splitted := strings.SplitN(param.String(), "|", 2) // séparateur est le deuxième argument.
+
+	groups := make(map[string][]interface{})
+
+	fetch_key := splitted[0]
+	separator := splitted[1]
+
+	in.Iterate(func (idx, count int, value *pongo2.Value, unused *pongo2.Value) bool {
+		val := deepGetValue(value, fetch_key)
+
+		if (val.IsString() && val.String() != "") {
+			// println(val.String())
+			items := strings.Split(val.String(), separator)
 			for _, item := range items {
-				groups[item] = append(groups[item], v)
+				groups[item] = append(groups[item], value.Interface())
 			}
-
 		}
-	}
-	return groups
+
+		return true
+	}, func () {
+		// empty.
+	})
+
+	return pongo2.AsValue(groups), nil
 }
+
 
 // groupBy groups a list of *RuntimeContainers by the path property key
-func groupBy(entries []*RuntimeContainer, key string) map[string][]*RuntimeContainer {
-	groups := make(map[string][]*RuntimeContainer)
-	for _, v := range entries {
-		value := deepGet(*v, key)
-		if value != nil {
-			groups[value.(string)] = append(groups[value.(string)], v)
+func groupBy(in *pongo2.Value, param *pongo2.Value) (out *pongo2.Value, err *pongo2.Error) {
+	groups := make(map[string][]interface{})
+	key := param.String()
+
+	in.Iterate(func (idx, count int, value *pongo2.Value, unused *pongo2.Value) bool {
+		val := deepGetValue(value, key)
+
+		if (val.IsString() && val.String() != "") {
+			// println(val.String())
+			groups[val.String()] = append(groups[val.String()], value.Interface())
 		}
-	}
-	return groups
+
+		return true
+	}, func () {
+		// empty.
+	})
+
+	return pongo2.AsValue(groups), nil
 }
 
 // groupByKeys is the same as groupBy but only returns a list of keys
-func groupByKeys(entries []*RuntimeContainer, key string) []string {
-	groups := groupBy(entries, key)
+func mapKeys(in *pongo2.Value, param *pongo2.Value) (out *pongo2.Value, err *pongo2.Error) {
 	ret := []string{}
-	for k, _ := range groups {
-		ret = append(ret, k)
-	}
-	return ret
-}
 
-// Generalized where function
-func generalizedWhere(funcName string, entries interface{}, key string, test func(interface{}) bool) (interface{}, error) {
-	entriesVal := reflect.ValueOf(entries)
-
-	switch entriesVal.Kind() {
-	case reflect.Array, reflect.Slice:
-		break
-	default:
-		return nil, fmt.Errorf("Must pass an array or slice to '%s'; received %v", funcName, entries)
-	}
-
-	selection := make([]interface{}, 0)
-	for i := 0; i < entriesVal.Len(); i++ {
-		v := reflect.Indirect(entriesVal.Index(i)).Interface()
-
-		value := deepGet(v, key)
-		if test(value) {
-			selection = append(selection, v)
+	in.Iterate(func (idx, count int, key *pongo2.Value, unused *pongo2.Value) bool {
+		if (key.IsString() && key.String() != "") {
+			ret = append(ret, key.String())
 		}
-	}
 
-	return selection, nil
-}
-
-// selects entries based on key
-func where(entries interface{}, key string, cmp interface{}) (interface{}, error) {
-	return generalizedWhere("where", entries, key, func(value interface{}) bool {
-		return reflect.DeepEqual(value, cmp)
+		return true
+	}, func () {
+		// empty.
 	})
-}
 
-// selects entries where a key exists
-func whereExist(entries interface{}, key string) (interface{}, error) {
-	return generalizedWhere("whereExist", entries, key, func(value interface{}) bool {
-		return value != nil
-	})
-}
-
-// selects entries where a key does not exist
-func whereNotExist(entries interface{}, key string) (interface{}, error) {
-	return generalizedWhere("whereNotExist", entries, key, func(value interface{}) bool {
-		return value == nil
-	})
-}
-
-// selects entries based on key.  Assumes key is delimited and breaks it apart before comparing
-func whereAny(entries interface{}, key, sep string, cmp []string) (interface{}, error) {
-	return generalizedWhere("whereAny", entries, key, func(value interface{}) bool {
-		if value == nil {
-			return false
-		} else {
-			items := strings.Split(value.(string), sep)
-			return len(intersect(cmp, items)) > 0
-		}
-	})
-}
-
-// selects entries based on key.  Assumes key is delimited and breaks it apart before comparing
-func whereAll(entries interface{}, key, sep string, cmp []string) (interface{}, error) {
-	req_count := len(cmp)
-	return generalizedWhere("whereAll", entries, key, func(value interface{}) bool {
-		if value == nil {
-			return false
-		} else {
-			items := strings.Split(value.(string), sep)
-			return len(intersect(cmp, items)) == req_count
-		}
-	})
+	return pongo2.AsValue(ret), nil
 }
 
 // hasPrefix returns whether a given string is a prefix of another string
@@ -146,192 +115,152 @@ func hasSuffix(suffix, s string) bool {
 	return strings.HasSuffix(s, suffix)
 }
 
-func keys(input interface{}) (interface{}, error) {
-	if input == nil {
-		return nil, nil
-	}
 
-	val := reflect.ValueOf(input)
-	if val.Kind() != reflect.Map {
-		return nil, fmt.Errorf("Cannot call keys on a non-map value: %v", input)
-	}
-
-	vk := val.MapKeys()
-	k := make([]interface{}, val.Len())
-	for i, _ := range k {
-		k[i] = vk[i].Interface()
-	}
-
-	return k, nil
-}
-
-func intersect(l1, l2 []string) []string {
-	m := make(map[string]bool)
-	m2 := make(map[string]bool)
-	for _, v := range l2 {
-		m2[v] = true
-	}
-	for _, v := range l1 {
-		if m2[v] {
-			m[v] = true
-		}
-	}
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
-}
-
-func contains(item map[string]string, key string) bool {
-	if _, ok := item[key]; ok {
-		return true
-	}
-	return false
-}
-
-func dict(values ...interface{}) (map[string]interface{}, error) {
-	if len(values)%2 != 0 {
-		return nil, errors.New("invalid dict call")
-	}
-	dict := make(map[string]interface{}, len(values)/2)
-	for i := 0; i < len(values); i += 2 {
-		key, ok := values[i].(string)
-		if !ok {
-			return nil, errors.New("dict keys must be strings")
-		}
-		dict[key] = values[i+1]
-	}
-	return dict, nil
-}
-
-func hashSha1(input string) string {
+func hashSha1(in *pongo2.Value, param *pongo2.Value) (*pongo2.Value, *pongo2.Error) {
 	h := sha1.New()
-	io.WriteString(h, input)
-	return fmt.Sprintf("%x", h.Sum(nil))
-}
-
-func marshalJson(input interface{}) (string, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	if err := enc.Encode(input); err != nil {
-		return "", err
-	}
-	return strings.TrimSuffix(buf.String(), "\n"), nil
-}
-
-func unmarshalJson(input string) (interface{}, error) {
-	var v interface{}
-	if err := json.Unmarshal([]byte(input), &v); err != nil {
-		return nil, err
-	}
-	return v, nil
+	io.WriteString(h, in.String())
+	return pongo2.AsValue(fmt.Sprintf("%x", h.Sum(nil))), nil
 }
 
 // arrayFirst returns first item in the array or nil if the
 // input is nil or empty
-func arrayFirst(input interface{}) interface{} {
-	if input == nil {
-		return nil
+func first(in *pongo2.Value, param *pongo2.Value) (*pongo2.Value, *pongo2.Error) {
+	if (!in.CanSlice()) {
+		return nil, &pongo2.Error{Sender:"filter:first", ErrorMsg: "not slicable"}
 	}
 
-	arr := reflect.ValueOf(input)
+	var val *pongo2.Value
 
-	if arr.Len() == 0 {
-		return nil
-	}
+	in.Iterate(func (idx, count int, value *pongo2.Value, unused *pongo2.Value) bool {
+		val = value
+		return false
+	}, func() {})
 
-	return arr.Index(0).Interface()
+	return val, nil
 }
 
 // arrayLast returns last item in the array
-func arrayLast(input interface{}) interface{} {
-	arr := reflect.ValueOf(input)
-	return arr.Index(arr.Len() - 1).Interface()
-}
-
-// arrayClosest find the longest matching substring in values
-// that matches input
-func arrayClosest(values []string, input string) string {
-	best := ""
-	for _, v := range values {
-		if strings.Contains(input, v) && len(v) > len(best) {
-			best = v
-		}
+func last(in *pongo2.Value, param *pongo2.Value) (*pongo2.Value, *pongo2.Error) {
+	if (!in.CanSlice()) {
+		return nil, &pongo2.Error{Sender:"filter:last", ErrorMsg: "not slicable"}
 	}
-	return best
+
+	var val *pongo2.Value
+
+	in.Iterate(func (idx, count int, value *pongo2.Value, unused *pongo2.Value) bool {
+		if (idx == count - 1) {
+			val = value
+			return false
+		}
+		return true
+	}, func() {})
+
+	return val, nil
 }
 
 // dirList returns a list of files in the specified path
-func dirList(path string) ([]string, error) {
+func dirList(in *pongo2.Value, param *pongo2.Value) (*pongo2.Value, *pongo2.Error) {
+
 	names := []string{}
-	files, err := ioutil.ReadDir(path)
+
+	files, err := ioutil.ReadDir(in.String())
+
 	if err != nil {
-		return names, err
+		return pongo2.AsValue(names), &pongo2.Error{Sender: "filter:dirList", ErrorMsg: err.Error()}
 	}
+
 	for _, f := range files {
 		names = append(names, f.Name())
 	}
-	return names, nil
+
+	return pongo2.AsValue(names), nil
 }
 
-// coalesce returns the first non nil argument
-func coalesce(input ...interface{}) interface{} {
-	for _, v := range input {
-		if v != nil {
-			return v
-		}
-	}
-	return nil
-}
 
 // trimPrefix returns whether a given string is a prefix of another string
-func trimPrefix(prefix, s string) string {
-	return strings.TrimPrefix(s, prefix)
+func trimPrefix(in *pongo2.Value, prefix *pongo2.Value) (*pongo2.Value, *pongo2.Error) {
+	return pongo2.AsValue(strings.TrimPrefix(in.String(), prefix.String())), nil
 }
 
-// trimSuffix returns whether a given string is a suffix of another string
-func trimSuffix(suffix, s string) string {
-	return strings.TrimSuffix(s, suffix)
+
+// trimSuffix returns whether a given string is a prefix of another string
+func trimSuffix(in *pongo2.Value, prefix *pongo2.Value) (*pongo2.Value, *pongo2.Error) {
+	return pongo2.AsValue(strings.TrimSuffix(in.String(), prefix.String())), nil
 }
 
-func newTemplate(name string) *template.Template {
-	tmpl := template.New(name).Funcs(template.FuncMap{
-		"closest":       arrayClosest,
-		"coalesce":      coalesce,
-		"contains":      contains,
-		"dict":          dict,
-		"dir":           dirList,
-		"exists":        exists,
-		"first":         arrayFirst,
-		"groupBy":       groupBy,
-		"groupByKeys":   groupByKeys,
-		"groupByMulti":  groupByMulti,
-		"hasPrefix":     hasPrefix,
-		"hasSuffix":     hasSuffix,
-		"json":          marshalJson,
-		"intersect":     intersect,
-		"keys":          keys,
-		"last":          arrayLast,
-		"replace":       strings.Replace,
-		"parseJson":     unmarshalJson,
-		"queryEscape":   url.QueryEscape,
-		"sha1":          hashSha1,
-		"split":         strings.Split,
-		"trimPrefix":    trimPrefix,
-		"trimSuffix":    trimSuffix,
-		"where":         where,
-		"whereExist":    whereExist,
-		"whereNotExist": whereNotExist,
-		"whereAny":      whereAny,
-		"whereAll":      whereAll,
-	})
-	return tmpl
+
+func jsonDecode(in *pongo2.Value, prefix *pongo2.Value) (*pongo2.Value, *pongo2.Error) {
+	// Getting the raw buffer to play with.
+	b := []byte(in.String())
+	var result interface{}
+
+	err := json.Unmarshal(b, &result)
+	if (err != nil) {
+		return pongo2.AsValue(nil), &pongo2.Error{Sender: "filter:jsonDecode", ErrorMsg: err.Error()}
+	}
+
+	return pongo2.AsValue(result), nil
 }
+
+/**
+ * Special tag to avoid empty lines, which are trimmed to a single \n char.
+ */
+
+var re_emptylines = regexp.MustCompile(`([\s]*\r?\n){2,}`)
+type tagMuteNode struct {
+	wrapper *pongo2.NodeWrapper
+}
+
+func (self *tagMuteNode) Execute(ctx *pongo2.ExecutionContext, buf *bytes.Buffer) *pongo2.Error {
+	b := bytes.NewBuffer(make([]byte, 0, 1024))
+	err := self.wrapper.Execute(ctx, b)
+
+	s2 := re_emptylines.ReplaceAllString(b.String(), "\n\n")
+	buf.WriteString(s2)
+
+	return err
+}
+
+
+func tagMuteParser(doc *pongo2.Parser, start *pongo2.Token, arguments *pongo2.Parser) (pongo2.INodeTag, *pongo2.Error) {
+	tagmuteNode := &tagMuteNode{}
+
+	wrapper, _, err := doc.WrapUntilTag("endmute")
+	if err != nil {
+		return nil, err
+	}
+
+	tagmuteNode.wrapper = wrapper
+
+	if arguments.Remaining() > 0 {
+		return nil, arguments.Error("Malformed mute-tag arguments.", nil)
+	}
+
+	return tagmuteNode, nil
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+
+func init() {
+	pongo2.RegisterFilter("groupByMulti", groupByMulti)
+	pongo2.RegisterFilter("groupBy", groupBy)
+	pongo2.RegisterFilter("keys", mapKeys)
+	pongo2.RegisterFilter("exists", exists)
+	pongo2.RegisterFilter("trimSuffix", trimSuffix)
+	pongo2.RegisterFilter("trimPrefix", trimPrefix)
+	pongo2.RegisterFilter("dirList", dirList)
+	pongo2.RegisterFilter("jsonDecode", jsonDecode)
+
+	pongo2.RegisterTag("mute", tagMuteParser)
+}
+
 
 func generateFile(config Config, containers Context) bool {
 	templatePath := config.Template
-	tmpl, err := newTemplate(filepath.Base(templatePath)).ParseFiles(templatePath)
+
+	tmpl, err := pongo2.FromFile(templatePath)
+
 	if err != nil {
 		log.Fatalf("unable to parse template: %s", err)
 	}
@@ -367,10 +296,15 @@ func generateFile(config Config, containers Context) bool {
 
 	var buf bytes.Buffer
 	multiwriter := io.MultiWriter(dest, &buf)
-	err = tmpl.ExecuteTemplate(multiwriter, filepath.Base(templatePath), &filteredContainers)
+
+	out := ""
+
+	out, err = tmpl.Execute(pongo2.Context{"containers": filteredContainers})
 	if err != nil {
 		log.Fatalf("template error: %s\n", err)
 	}
+
+	io.WriteString(multiwriter, out)
 
 	if config.Dest != "" {
 
